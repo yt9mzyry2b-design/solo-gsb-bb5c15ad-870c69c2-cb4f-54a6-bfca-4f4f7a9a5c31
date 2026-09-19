@@ -77,6 +77,8 @@
       <ul id="share-list" class="share-list"></ul>
 
       <h3>添加注入卡片</h3>
+      <p class="hint">可为卡片设置「回执门槛」：选择一张前置卡片后，本卡需等前置卡的目标参与组
+        <strong>全部回执</strong>才揭示；可再设虚拟时钟超时秒数（自本卡触发点起算），超时强制揭示并标记「超时揭示」。</p>
       <form id="card-form">
         <div class="form-row">
           <input id="card-title" type="text" placeholder="卡片标题，如：告警风暴出现" required maxlength="200">
@@ -85,6 +87,14 @@
         <select id="card-target" title="卡片目标：全员或某个参与组">
           <option value="">全员</option>
         </select>
+        <div class="form-row">
+          <select id="card-gate" title="回执门槛（可选）：选择前置卡片，其目标参与组全部回执后本卡才揭示">
+            <option value="">无回执门槛（到点即揭示）</option>
+          </select>
+          <input id="card-gate-timeout" type="number" min="1" max="86400" step="1"
+                 placeholder="超时秒数（可选）" disabled
+                 title="虚拟时钟超时秒数：自本卡触发点起等待前置回执的最长秒数，超时强制揭示；留空则一直等待">
+        </div>
         <textarea id="card-content" rows="2" placeholder="注入内容 / 情景描述（参与者可见）" maxlength="4000"></textarea>
         <button type="submit" class="primary">添加卡片</button>
         <span id="card-form-hint" class="hint"></span>

@@ -34,15 +34,18 @@ CREATE TABLE IF NOT EXISTS groups (
 );
 
 CREATE TABLE IF NOT EXISTS cards (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_id         INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    seq             INTEGER NOT NULL,                 -- 房间内稳定序号，揭示次序的决胜键
-    trigger_seconds INTEGER NOT NULL,                 -- 相对演练开始的触发秒数
-    title           TEXT NOT NULL,
-    content         TEXT NOT NULL DEFAULT '',
-    group_id        INTEGER REFERENCES groups(id),    -- NULL = 全员；否则仅该参与组可见
-    revealed        INTEGER NOT NULL DEFAULT 0,
-    revealed_at_ms  INTEGER,                          -- 揭示时的虚拟时钟毫秒
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id              INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    seq                  INTEGER NOT NULL,                 -- 房间内稳定序号，揭示次序的决胜键
+    trigger_seconds      INTEGER NOT NULL,                 -- 相对演练开始的触发秒数
+    title                TEXT NOT NULL,
+    content              TEXT NOT NULL DEFAULT '',
+    group_id             INTEGER REFERENCES groups(id),    -- NULL = 全员；否则仅该参与组可见
+    depends_on_card_id   INTEGER REFERENCES cards(id),     -- 回执门槛：前置卡片；NULL = 无门槛
+    gate_timeout_seconds INTEGER,                          -- 虚拟时钟超时秒数（自触发点起算）；NULL = 一直等待
+    revealed             INTEGER NOT NULL DEFAULT 0,
+    revealed_at_ms       INTEGER,                          -- 揭示时的虚拟时钟毫秒
+    reveal_reason        TEXT,                             -- schedule | gate | timeout；未揭示为 NULL
     UNIQUE (room_id, seq)
 );
 
@@ -76,6 +79,7 @@ CREATE TABLE IF NOT EXISTS observer_shares (
 
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_cards_depends ON cards(depends_on_card_id);
 CREATE INDEX IF NOT EXISTS idx_groups_room ON groups(room_id);
 CREATE INDEX IF NOT EXISTS idx_events_room ON events(room_id, id);
 CREATE INDEX IF NOT EXISTS idx_receipts_room ON receipts(room_id, card_id);
@@ -85,10 +89,14 @@ CREATE INDEX IF NOT EXISTS idx_observer_shares_room ON observer_shares(room_id);
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """旧库就地升级：cards 表补 group_id 列（既有卡片一律视为全员）。
+    """旧库就地升级：cards 表补列。
 
-    必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group
-    索引依赖该列，旧库需先补列才能建索引。
+    - group_id：既有卡片一律视为全员；
+    - depends_on_card_id / gate_timeout_seconds / reveal_reason：回执门槛，
+      既有卡片一律无门槛、按普通到点揭示（reveal_reason 保持 NULL，视为 schedule）。
+
+    必须在 executescript(SCHEMA) 之前执行：SCHEMA 里的 idx_cards_group 等
+    索引依赖这些列，旧库需先补列才能建索引。
     """
     table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"
@@ -98,7 +106,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(cards)")}
     if "group_id" not in cols:
         conn.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER REFERENCES groups(id)")
-        conn.commit()
+    if "depends_on_card_id" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN depends_on_card_id INTEGER REFERENCES cards(id)")
+    if "gate_timeout_seconds" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN gate_timeout_seconds INTEGER")
+    if "reveal_reason" not in cols:
+        conn.execute("ALTER TABLE cards ADD COLUMN reveal_reason TEXT")
+    conn.commit()
 
 
 def connect() -> sqlite3.Connection:

@@ -13,6 +13,10 @@
  * - 观察者：限时观察链接（#/observe/{token}）进入，只读——只能看到已揭示的
  *   全员卡片与分享所选组卡片，拿不到房间码、组加入码、未揭示卡片与回执明细；
  *   链接到期或被撤销时服务端主动断开，重连也会被拒绝。
+ *
+ * 回执门槛：主持人可为卡片指定前置卡与虚拟时钟超时秒数；前置卡目标组全部
+ * 回执后门槛卡到点揭示（gate），超时仍未集齐则强制揭示并标记「超时揭示」。
+ * 主持人端的等待/已解锁状态由前置卡的 receipts 实时推导，无需额外事件。
  */
 
 const $ = (sel) => document.querySelector(sel);
@@ -191,6 +195,50 @@ function sortedCards() {
   return [...state.cards].sort((a, b) => a.trigger_seconds - b.trigger_seconds || a.seq - b.seq);
 }
 
+/* 回执门槛：主持人端由前置卡的 receipts 实时推导（与服务端口径一致：
+   前置卡目标组 = 全员卡取全部参与组 / 定向卡取目标组，全部回执即解锁） */
+function gateStatusOf(card) {
+  if (card.depends_on_card_id == null || card.revealed) return null;
+  const pre = state.cards.find((c) => c.id === card.depends_on_card_id);
+  if (!pre || !pre.receipts) return 'waiting';
+  return pre.receipts.expected.every((g) => pre.receipts.acked.includes(g)) ? 'unlocked' : 'waiting';
+}
+
+/* 主持人：卡片表单的前置卡下拉（可选任意已存在的卡片；依赖边恒指向更早的卡，天然无环） */
+function renderGateOptions() {
+  if (state.role !== 'host') return;
+  const sel = $('#card-gate');
+  const cur = sel.value;
+  sel.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '无回执门槛（到点即揭示）';
+  sel.appendChild(none);
+  for (const c of sortedCards()) {
+    const opt = document.createElement('option');
+    opt.value = String(c.id);
+    opt.textContent = `#${c.seq} · ${c.title}（T+${fmt(c.trigger_seconds * 1000)}）`;
+    sel.appendChild(opt);
+  }
+  sel.value = [...sel.options].some((o) => o.value === cur) ? cur : '';
+  const editing = state.status !== 'running';
+  sel.disabled = !editing;
+  $('#card-gate-timeout').disabled = !editing || !sel.value;
+}
+
+/* 主持人：门槛卡的前置/超时说明行 */
+function gateLine(card) {
+  const pre = state.cards.find((c) => c.id === card.depends_on_card_id);
+  const preLabel = pre ? `#${pre.seq}「${pre.title}」` : `卡片 #${card.depends_on_card_id}`;
+  const timeout = card.gate_timeout_seconds != null
+    ? `超时于 T+${fmt((card.trigger_seconds + card.gate_timeout_seconds) * 1000)} 强制揭示`
+    : '无超时（一直等待回执）';
+  const div = document.createElement('div');
+  div.className = 'gate-line';
+  div.textContent = `回执门槛：前置 ${preLabel} 的目标组全部回执后揭示 · ${timeout}`;
+  return div;
+}
+
 function renderCards() {
   const list = $('#card-list');
   list.innerHTML = '';
@@ -222,7 +270,16 @@ function renderCards() {
 
     const right = document.createElement('span');
     if (card.revealed) {
-      right.innerHTML = `<span class="badge badge-revealed">已揭示 ${fmt(card.revealed_at_ms || 0)}</span>`;
+      if (card.reveal_reason === 'timeout') {
+        right.innerHTML = `<span class="badge badge-timeout">超时揭示 ${fmt(card.revealed_at_ms || 0)}</span>`;
+      } else {
+        right.innerHTML = `<span class="badge badge-revealed">已揭示 ${fmt(card.revealed_at_ms || 0)}</span>`;
+      }
+    } else if (state.role === 'host' && card.depends_on_card_id != null) {
+      // 门槛卡待触发：等待前置回执 / 已解锁到点即揭示
+      right.innerHTML = gateStatusOf(card) === 'unlocked'
+        ? '<span class="badge badge-gate-ok">已解锁 · 到点揭示</span>'
+        : '<span class="badge badge-gate-wait">等待回执解锁</span>';
     } else {
       right.innerHTML = '<span class="badge badge-pending">待触发</span>';
     }
@@ -250,12 +307,16 @@ function renderCards() {
       content.textContent = card.content;
       li.appendChild(content);
     }
+    if (state.role === 'host' && card.depends_on_card_id != null) {
+      li.appendChild(gateLine(card));
+    }
     if (state.role === 'host' && card.revealed) {
       const summary = receiptSummary(card);
       if (summary) li.appendChild(summary);
     }
     list.appendChild(li);
   }
+  renderGateOptions();
 }
 
 /* 参与者：已揭示卡片上的「已收到」开关（可撤销） */
@@ -517,6 +578,7 @@ function applyEvent(msg) {
       state.cards.forEach((c) => {
         c.revealed = false;
         c.revealed_at_ms = null;
+        c.reveal_reason = null; // 超时/门槛揭示标记一并收回
         if (c.receipts) c.receipts.acked = []; // 回执随揭示一并收回
         if ('my_receipt' in c) c.my_receipt = false;
       });
@@ -671,19 +733,36 @@ $('#group-form').onsubmit = async (e) => {
 
 $('#card-form').onsubmit = async (e) => {
   e.preventDefault();
+  const gateId = $('#card-gate').value ? parseInt($('#card-gate').value, 10) : null;
+  const timeoutRaw = $('#card-gate-timeout').value.trim();
+  const timeout = gateId && timeoutRaw ? parseInt(timeoutRaw, 10) : null;
+  if (gateId && timeoutRaw && (!Number.isInteger(timeout) || timeout < 1 || timeout > 86400)) {
+    showError(new Error('超时秒数须为 1～86400 的整数'));
+    return;
+  }
   const body = {
     title: $('#card-title').value.trim(),
     content: $('#card-content').value.trim(),
     trigger_seconds: parseInt($('#card-trigger').value, 10) || 0,
     group_id: $('#card-target').value ? parseInt($('#card-target').value, 10) : null,
+    depends_on_card_id: gateId,
+    gate_timeout_seconds: timeout,
   };
   try {
     await api('POST', `/api/rooms/${state.code}/cards`, body);
     $('#card-title').value = '';
     $('#card-content').value = '';
     $('#card-trigger').value = '';
+    $('#card-gate').value = '';
+    $('#card-gate-timeout').value = '';
+    $('#card-gate-timeout').disabled = true;
     $('#card-title').focus();
   } catch (err) { showError(err); }
+};
+
+/* 选择前置卡后才允许填写超时秒数 */
+$('#card-gate').onchange = () => {
+  $('#card-gate-timeout').disabled = !$('#card-gate').value || state.status === 'running';
 };
 
 $('#share-form').onsubmit = async (e) => {
