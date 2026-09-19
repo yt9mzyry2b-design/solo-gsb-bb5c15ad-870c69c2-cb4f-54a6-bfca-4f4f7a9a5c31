@@ -6,6 +6,9 @@
 - 后台 tick：按 (trigger_seconds, seq) 稳定次序揭示到期卡片
 - 卡片回执：参与者对已揭示的本组可见卡片标记/撤销「已收到」，
   同一参与组仅保留一条回执；主持人实时看到每组回执/未回执汇总
+- 回执门槛：卡片可依赖一张前置卡片，前置卡片对其目标参与组全部集齐回执后才揭示；
+  可配虚拟时钟超时秒数（自触发时刻起算），超时仍未集齐则标记为超时揭示并继续；
+  门槛状态由持久化的回执与卡片字段推导，暂停/继续、重置、重连与重启后均保持
 - 限时观察席分享：主持人选择 1~3 个参与组并设置 5~120 分钟有效期，
   生成可撤销的随机观察链接；观察者只读，仅能收到已揭示的全员卡片与
   所选组卡片，拿不到未揭示卡、房间码、组加入码、回执明细与控制能力；
@@ -137,6 +140,79 @@ def resolve_code(code: str) -> tuple[sqlite3.Row | None, int | None]:
         room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
         return room, group["id"]
     return None, None
+
+
+# ---------------------------------------------------------------- 回执门槛
+
+def gate_pending_groups(card: sqlite3.Row, dep: sqlite3.Row) -> list[int]:
+    """前置卡片尚未集齐回执的目标参与组 id 列表；空列表 = 门槛已满足。
+
+    期望回执组与回执汇总同一口径：前置为全员卡取房间全部参与组，
+    定向卡只取目标组；已回执组现查 receipts 表（回执持久化在 SQLite，
+    暂停/重连/重启后门槛状态不丢）。
+    """
+    if dep["group_id"] is not None:
+        expected = [dep["group_id"]]
+    else:
+        expected = [r["id"] for r in db.execute(
+            "SELECT id FROM groups WHERE room_id = ? ORDER BY id", (card["room_id"],)
+        )]
+    if not expected:
+        return []
+    acked = {r["group_id"] for r in db.execute(
+        "SELECT group_id FROM receipts WHERE card_id = ?", (dep["id"],)
+    )}
+    return [gid for gid in expected if gid not in acked]
+
+
+def gate_view(card: sqlite3.Row) -> dict | None:
+    """主持人视野的回执门槛状态；无门槛卡片返回 None（不下发该字段）。
+
+    state：waiting（等待前置集齐回执）| unlocked（门槛已解锁）| timeout（超时揭示）。
+    门槛细节只给主持人：参与者/观察者按既有视野过滤，不感知编排依赖。
+    """
+    dep_id = card["depends_on_card_id"]
+    if dep_id is None:
+        return None
+    dep = db.execute("SELECT * FROM cards WHERE id = ?", (dep_id,)).fetchone()
+    pending = gate_pending_groups(card, dep)
+    if card["revealed"]:
+        state = "timeout" if card["timed_out"] else "unlocked"
+    else:
+        state = "waiting" if pending else "unlocked"
+    return {
+        "depends_on_card_id": dep_id,
+        "depends_on_seq": dep["seq"],
+        "gate_timeout_seconds": card["gate_timeout_seconds"],
+        "state": state,
+        "pending_groups": pending,  # 尚未回执的前置目标组
+    }
+
+
+async def publish_gate_refresh(room: sqlite3.Row, dep_card_id: int) -> None:
+    """前置卡片回执变化后，刷新依赖它的未揭示卡片的门槛状态（仅主持人可见）。
+
+    已揭示卡片的门槛状态（unlocked/timeout）是历史事实，不再随回执变化。
+    须在 state_lock 下调用。
+    """
+    dependents = db.execute(
+        "SELECT * FROM cards WHERE depends_on_card_id = ? AND revealed = 0", (dep_card_id,)
+    ).fetchall()
+    for card in dependents:
+        await publish(room["code"], room["id"], "gate_updated",
+                      {"card_id": card["id"], "gate": gate_view(card)})
+
+
+async def publish_room_gate_refresh(room: sqlite3.Row) -> None:
+    """参与组增删 / 重置后，重算全房间未揭示卡片的门槛状态。须在 state_lock 下调用。"""
+    gated = db.execute(
+        """SELECT * FROM cards
+           WHERE room_id = ? AND depends_on_card_id IS NOT NULL AND revealed = 0""",
+        (room["id"],),
+    ).fetchall()
+    for card in gated:
+        await publish(room["code"], room["id"], "gate_updated",
+                      {"card_id": card["id"], "gate": gate_view(card)})
 
 
 # ---------------------------------------------------------------- 观察席分享
@@ -280,6 +356,9 @@ def snapshot_cards(room: sqlite3.Row, cards: list[sqlite3.Row],
                 "expected": expected,
                 "acked": [gid for gid in expected if gid in acked],
             }
+            gate = gate_view(card)  # 门槛状态仅主持人可见
+            if gate is not None:
+                data["gate"] = gate
             out.append(data)
         return out
     # 参与者：仅本组是否已回执
@@ -305,8 +384,8 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     观察者只收已揭示卡片揭示/移除与房间级事件。"""
     if scope is None:
         return True
-    if type_.startswith("share_"):
-        return False  # 分享事件含观察凭证，仅主持人可见
+    if type_.startswith("share_") or type_ == "gate_updated":
+        return False  # 分享凭证与门槛编排细节仅主持人可见
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed"):
             gid = payload.get("group_id")
@@ -425,7 +504,12 @@ async def expire_due_shares() -> None:
 
 
 async def ticker_loop() -> None:
-    """周期性扫描 running 房间，按 (trigger_seconds, seq) 稳定揭示到期卡片。"""
+    """周期性扫描 running 房间，按 (trigger_seconds, seq) 稳定揭示到期卡片。
+
+    带回执门槛的卡片到期后先检查前置卡片回执：未集齐则继续等待；
+    虚拟时钟超过 触发秒数 + 超时秒数 仍未集齐时，标记为超时揭示并继续。
+    暂停期间时钟冻结，门槛计时同样不推进。
+    """
     while True:
         await asyncio.sleep(TICK_INTERVAL)
         try:
@@ -440,14 +524,32 @@ async def ticker_loop() -> None:
                         (room["id"], elapsed),
                     ).fetchall()
                     for card in due:
+                        timed_out = False
+                        if card["depends_on_card_id"] is not None:
+                            dep = db.execute(
+                                "SELECT * FROM cards WHERE id = ?",
+                                (card["depends_on_card_id"],),
+                            ).fetchone()
+                            if gate_pending_groups(card, dep):
+                                timeout = card["gate_timeout_seconds"]
+                                deadline = (card["trigger_seconds"] + timeout) * 1000 if timeout is not None else None
+                                if deadline is None or elapsed < deadline:
+                                    continue  # 门槛未满足且未超时：保持等待
+                                timed_out = True  # 虚拟时钟超时：标记为超时揭示并继续
                         db.execute(
-                            "UPDATE cards SET revealed = 1, revealed_at_ms = ? WHERE id = ?",
-                            (elapsed, card["id"]),
+                            "UPDATE cards SET revealed = 1, revealed_at_ms = ?, timed_out = ? WHERE id = ?",
+                            (elapsed, 1 if timed_out else 0, card["id"]),
                         )
                         db.commit()
                         fresh = db.execute("SELECT * FROM cards WHERE id = ?", (card["id"],)).fetchone()
                         await publish(room["code"], room["id"], "card_revealed", card_public(fresh))
-                        log.info("room %s revealed card #%s (%s)", room["code"], card["seq"], card["title"])
+                        if timed_out:
+                            await publish(room["code"], room["id"], "gate_updated",
+                                          {"card_id": fresh["id"], "gate": gate_view(fresh)})
+                            log.info("room %s gate timeout, revealed card #%s (%s)",
+                                     room["code"], card["seq"], card["title"])
+                        else:
+                            log.info("room %s revealed card #%s (%s)", room["code"], card["seq"], card["title"])
                 await expire_due_shares()
         except asyncio.CancelledError:
             raise
@@ -532,6 +634,8 @@ async def add_group(code: str, body: GroupIn):
         group = db.execute("SELECT * FROM groups WHERE id = ?", (cur.lastrowid,)).fetchone()
         payload = group_public(group)
         await publish(room["code"], room["id"], "group_added", payload)
+        # 新组成为所有全员卡的待回执方，相关门槛可能由解锁回到等待
+        await publish_room_gate_refresh(room)
         return payload
 
 
@@ -561,6 +665,8 @@ async def delete_group(code: str, group_id: int):
         db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         db.commit()
         await publish(room["code"], room["id"], "group_removed", {"id": group_id})
+        # 该组回执已级联删除、全员卡期望组收缩，相关门槛状态随之变化
+        await publish_room_gate_refresh(room)
         # 加入码即刻失效，踢下仍在连接的该组参与者
         await hub.close_scope(room["code"], group_id, {"kind": "error", "message": "所在参与组已被主持人删除"})
         return {"ok": True}
@@ -573,6 +679,8 @@ class CardIn(BaseModel):
     content: str = Field(default="", max_length=4000)
     trigger_seconds: int = Field(ge=0, le=24 * 3600)
     group_id: int | None = None  # None = 全员，否则仅该参与组可见
+    depends_on_card_id: int | None = None  # 回执门槛：前置卡片 id；None = 无门槛
+    gate_timeout_seconds: int | None = Field(default=None, ge=1, le=24 * 3600)  # 虚拟时钟超时秒数
 
 
 @app.post("/api/rooms/{code}/cards", status_code=201)
@@ -583,18 +691,35 @@ async def add_card(code: str, body: CardIn):
             raise HTTPException(status_code=409, detail="clock is running; pause before editing cards")
         if body.group_id is not None:
             get_group_or_404(room["id"], body.group_id)  # 目标组必须属于本房间
+        if body.depends_on_card_id is not None:
+            dep = db.execute(
+                "SELECT 1 FROM cards WHERE id = ? AND room_id = ?",
+                (body.depends_on_card_id, room["id"]),
+            ).fetchone()
+            if dep is None:
+                raise HTTPException(status_code=404, detail="dependency card not found")
+            # 依赖边只会指向更早创建的卡片，依赖图天然是无环的，无需环检测
+        elif body.gate_timeout_seconds is not None:
+            raise HTTPException(status_code=400,
+                                detail="gate_timeout_seconds requires depends_on_card_id")
         seq = db.execute(
             "SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM cards WHERE room_id = ?", (room["id"],)
         ).fetchone()["s"]
         cur = db.execute(
-            "INSERT INTO cards (room_id, seq, trigger_seconds, title, content, group_id)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (room["id"], seq, body.trigger_seconds, body.title.strip(), body.content, body.group_id),
+            "INSERT INTO cards (room_id, seq, trigger_seconds, title, content, group_id,"
+            " depends_on_card_id, gate_timeout_seconds)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (room["id"], seq, body.trigger_seconds, body.title.strip(), body.content,
+             body.group_id, body.depends_on_card_id, body.gate_timeout_seconds),
         )
         db.commit()
         card = db.execute("SELECT * FROM cards WHERE id = ?", (cur.lastrowid,)).fetchone()
         payload = card_public(card)
         await publish(room["code"], room["id"], "card_added", payload)
+        if card["depends_on_card_id"] is not None:
+            # card_added 不带门槛字段，单独下发主持人专属的门槛视图
+            await publish(room["code"], room["id"], "gate_updated",
+                          {"card_id": card["id"], "gate": gate_view(card)})
         return payload
 
 
@@ -609,6 +734,12 @@ async def delete_card(code: str, card_id: int):
         ).fetchone()
         if card is None:
             raise HTTPException(status_code=404, detail="card not found")
+        deps = db.execute(
+            "SELECT COUNT(*) AS c FROM cards WHERE depends_on_card_id = ?", (card_id,)
+        ).fetchone()["c"]
+        if deps:
+            raise HTTPException(status_code=409,
+                                detail=f"card is a gate dependency of {deps} card(s)")
         db.execute("DELETE FROM cards WHERE id = ?", (card_id,))
         db.commit()
         # 带上 group_id，广播过滤才能判断该事件是否属于某参与组的视野
@@ -661,6 +792,7 @@ async def ack_card(join_code: str, card_id: int):
             room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
             await publish(room["code"], room["id"], "receipt_updated",
                           {"card_id": card_id, "group_id": group["id"], "acked": True})
+            await publish_gate_refresh(room, card_id)  # 可能解锁依赖本卡的门槛
         return {"card_id": card_id, "group_id": group["id"], "acked": True}
 
 
@@ -678,6 +810,7 @@ async def unack_card(join_code: str, card_id: int):
             room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
             await publish(room["code"], room["id"], "receipt_updated",
                           {"card_id": card_id, "group_id": group["id"], "acked": False})
+            await publish_gate_refresh(room, card_id)  # 依赖本卡的门槛可能回到等待
         return {"card_id": card_id, "group_id": group["id"], "acked": False}
 
 
@@ -796,9 +929,10 @@ async def resume_room(code: str):
 
 @app.post("/api/rooms/{code}/reset")
 async def reset_room(code: str):
-    """归零时钟并收回已揭示卡片；参与组、加入码与卡片目标全部保留。
+    """归零时钟并收回已揭示卡片；参与组、加入码、卡片目标与门槛编排全部保留。
 
-    回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计。
+    回执随揭示一并收回：未揭示卡片不可回执，新一轮演练从零开始统计；
+    门槛超时标记同时清零，门槛回到等待状态。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -808,11 +942,15 @@ async def reset_room(code: str):
             "UPDATE rooms SET status = 'idle', elapsed_ms = 0, last_resume_at = NULL WHERE id = ?",
             (room["id"],),
         )
-        db.execute("UPDATE cards SET revealed = 0, revealed_at_ms = NULL WHERE room_id = ?", (room["id"],))
+        db.execute(
+            "UPDATE cards SET revealed = 0, revealed_at_ms = NULL, timed_out = 0 WHERE room_id = ?",
+            (room["id"],),
+        )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.commit()
         payload = {"action": "reset", "status": "idle", "elapsed_ms": 0}
         await publish(room["code"], room["id"], "reset", payload)
+        await publish_room_gate_refresh(room)  # 回执已清空，门槛回到等待
         return payload
 
 

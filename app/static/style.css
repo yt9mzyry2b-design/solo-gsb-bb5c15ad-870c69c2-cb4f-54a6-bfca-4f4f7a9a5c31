@@ -244,3 +244,14 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .receipt-chip { padding: 2px 8px; border-radius: 999px; font-size: 11px; }
 .receipt-ok   { background: rgba(62, 207, 142, .15); color: var(--green); }
 .receipt-wait { background: rgba(139, 150, 173, .15); color: var(--muted); }
+
+/* 回执门槛状态（仅主持人可见） */
+.gate-status {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+.gate-waiting  { color: var(--amber); }
+.gate-unlocked { color: var(--green); }
+.gate-timeout  { color: var(--red); }

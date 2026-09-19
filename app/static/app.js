@@ -8,8 +8,10 @@
  * 3. 之后只应用 id > 水位的增量事件，旧事件一律丢弃，状态绝不回退。
  *
  * 三种角色：
- * - 主持人：房间码连接（全量视野，含观察分享管理）；
- * - 参与者：组加入码连接（服务端按组过滤快照与事件）；
+ * - 主持人：房间码连接（全量视野，含观察分享管理与回执门槛编排——卡片可依赖
+ *   前置卡片，前置集齐目标组回执后才揭示，可设虚拟时钟超时秒数，超时标记为
+ *   「超时揭示」；门槛状态仅主持人可见，随 gate_updated 事件与快照下发）；
+ * - 参与者：组加入码连接（服务端按组过滤快照与事件，不感知门槛编排）；
  * - 观察者：限时观察链接（#/observe/{token}）进入，只读——只能看到已揭示的
  *   全员卡片与分享所选组卡片，拿不到房间码、组加入码、未揭示卡片与回执明细；
  *   链接到期或被撤销时服务端主动断开，重连也会被拒绝。
@@ -187,6 +189,25 @@ function renderGroups() {
   }
 }
 
+/* 主持人：回执门槛的前置卡片下拉（已有卡片均可作前置）；尽量保留当前选择 */
+function renderGateOptions() {
+  if (state.role !== 'host') return;
+  const sel = $('#card-gate');
+  const cur = sel.value;
+  sel.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '无门槛：到点即揭示';
+  sel.appendChild(none);
+  for (const c of sortedCards()) {
+    const opt = document.createElement('option');
+    opt.value = String(c.id);
+    opt.textContent = `前置 #${c.seq} · ${c.title}（T+${fmt(c.trigger_seconds * 1000)}）`;
+    sel.appendChild(opt);
+  }
+  sel.value = [...sel.options].some((o) => o.value === cur) ? cur : '';
+}
+
 function sortedCards() {
   return [...state.cards].sort((a, b) => a.trigger_seconds - b.trigger_seconds || a.seq - b.seq);
 }
@@ -250,12 +271,38 @@ function renderCards() {
       content.textContent = card.content;
       li.appendChild(content);
     }
+    if (state.role === 'host' && card.gate) {
+      li.appendChild(gateStatus(card));
+    }
     if (state.role === 'host' && card.revealed) {
       const summary = receiptSummary(card);
       if (summary) li.appendChild(summary);
     }
     list.appendChild(li);
   }
+}
+
+/* 主持人：回执门槛状态行——等待（含未回执组与超时点）/ 已解锁 / 超时揭示 */
+function gateStatus(card) {
+  const g = card.gate;
+  const box = document.createElement('div');
+  box.className = `gate-status gate-${g.state}`;
+  const parts = [];
+  if (g.state === 'waiting') {
+    parts.push(`⏳ 回执门槛：等待前置 #${g.depends_on_seq} 集齐回执`);
+    if (g.pending_groups.length) {
+      parts.push(`（未回执：${g.pending_groups.map(groupName).join('、')}）`);
+    }
+    if (g.gate_timeout_seconds != null) {
+      parts.push(`· 超时点 T+${fmt((card.trigger_seconds + g.gate_timeout_seconds) * 1000)}`);
+    }
+  } else if (g.state === 'unlocked') {
+    parts.push(`🔓 回执门槛已解锁（前置 #${g.depends_on_seq} 已集齐回执）`);
+  } else {
+    parts.push(`⏰ 超时揭示（前置 #${g.depends_on_seq} 回执未集齐）`);
+  }
+  box.textContent = parts.join(' ');
+  return box;
 }
 
 /* 参与者：已揭示卡片上的「已收到」开关（可撤销） */
@@ -414,6 +461,7 @@ function updateShareCountdowns() {
 function renderAll() {
   renderMeta();
   renderGroups();
+  renderGateOptions();
   renderShares();
   renderCards();
 }
@@ -476,6 +524,12 @@ function applyEvent(msg) {
       } else if (state.role === 'player' && p.group_id === state.groupId) {
         card.my_receipt = p.acked;
       }
+      break;
+    }
+    case 'gate_updated': {
+      // 仅主持人会收到：门槛状态由服务端权威计算，直接替换
+      const card = state.cards.find((c) => c.id === p.card_id);
+      if (card) card.gate = p.gate;
       break;
     }
     case 'group_added':
@@ -671,17 +725,27 @@ $('#group-form').onsubmit = async (e) => {
 
 $('#card-form').onsubmit = async (e) => {
   e.preventDefault();
+  const gateId = $('#card-gate').value;
+  const gateTimeout = $('#card-gate-timeout').value.trim();
+  if (gateTimeout && !gateId) {
+    showError(new Error('设置超时秒数需先选择前置卡片'));
+    return;
+  }
   const body = {
     title: $('#card-title').value.trim(),
     content: $('#card-content').value.trim(),
     trigger_seconds: parseInt($('#card-trigger').value, 10) || 0,
     group_id: $('#card-target').value ? parseInt($('#card-target').value, 10) : null,
+    depends_on_card_id: gateId ? parseInt(gateId, 10) : null,
+    gate_timeout_seconds: gateTimeout ? parseInt(gateTimeout, 10) : null,
   };
   try {
     await api('POST', `/api/rooms/${state.code}/cards`, body);
     $('#card-title').value = '';
     $('#card-content').value = '';
     $('#card-trigger').value = '';
+    $('#card-gate').value = '';
+    $('#card-gate-timeout').value = '';
     $('#card-title').focus();
   } catch (err) { showError(err); }
 };

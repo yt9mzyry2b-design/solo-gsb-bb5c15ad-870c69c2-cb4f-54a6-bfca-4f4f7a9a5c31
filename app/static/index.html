@@ -85,6 +85,15 @@
         <select id="card-target" title="卡片目标：全员或某个参与组">
           <option value="">全员</option>
         </select>
+        <p class="hint">回执门槛（可选）：选择前置卡片后，本卡需等前置卡片的目标参与组全部回执才揭示；
+          可再设虚拟时钟超时秒数（自触发时刻起算），超时仍未集齐则标记为「超时揭示」并继续。</p>
+        <div class="form-row">
+          <select id="card-gate" title="回执门槛：前置卡片集齐回执后才揭示本卡">
+            <option value="">无门槛：到点即揭示</option>
+          </select>
+          <input id="card-gate-timeout" type="number" min="1" max="86400" step="1"
+                 placeholder="超时秒数（可选）" title="虚拟时钟超时秒数：自触发时刻起算，超时仍未集齐回执则标记为超时揭示">
+        </div>
         <textarea id="card-content" rows="2" placeholder="注入内容 / 情景描述（参与者可见）" maxlength="4000"></textarea>
         <button type="submit" class="primary">添加卡片</button>
         <span id="card-form-hint" class="hint"></span>
